@@ -1,220 +1,167 @@
+/*
+ * ============================================================
+ *  ESP8266 ROBOT ARM - KONTROL LANGSUNG DARI OPENPLC
+ * ============================================================
+ *  Alamat Holding Register di OpenPLC:
+ *    %QW0 (Offset 0) -> Servo Base     (Pin D1 / GPIO 5)
+ *    %QW1 (Offset 1) -> Servo Shoulder (Pin D2 / GPIO 4)
+ *    %QW2 (Offset 2) -> Servo Elbow    (Pin D5 / GPIO 14)
+ *    %QW3 (Offset 3) -> Servo Gripper  (Pin D6 / GPIO 12)
+ *
+ *  Cara Kerja:
+ *    Begitu OpenPLC mengeksekusi blok MOVE dengan output ke %QW
+ *    (misal MOVE 180 ke %QW2), servo langsung bergerak ke sudut itu!
+ * ============================================================
+ */
+
 #include <ESP8266WiFi.h>
+#include <ModbusIP_ESP8266.h>
 #include <Servo.h>
 
-// Inisialisasi 4 Servo
-Servo servoBase;     // Servo 1: Base (GPIO 5 / D1) - DIKUNCI DI 180°
-Servo servoShoulder; // Servo 2: Shoulder (GPIO 4 / D2)
-Servo servoElbow;    // Servo 3: Elbow (GPIO 14 / D5)
-Servo servoGripper;  // Servo 4: Gripper (GPIO 12 / D6)
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
 
-// Pin GPIO Servo
-const int PIN_SERVO1 = 5;
-const int PIN_SERVO2 = 4;
-const int PIN_SERVO3 = 14;
-const int PIN_SERVO4 = 12;
+#ifndef WIFI_SSID
+#define WIFI_SSID "apacoba"
+#define WIFI_PASS "12345678"
+#endif
 
-// ===== Sensor Infrared =====
-const int  PIN_IR = 16;              // GPIO 16 (D0) -> OUT sensor IR
-const bool IR_ACTIVE_LOW = true;     // true: LOW = ada benda (umum di modul FC-51)
-const int  IR_CONFIRM_MS = 10;       // Sensor harus stabil mendeteksi selama ini (anti-noise)
-const int  STOP_SETTLE_MS = 100;     // Tunggu benda diam setelah conveyor berhenti
-const unsigned long COOLDOWN_MS = 0; // Abaikan sensor sebentar setelah conveyor jalan lagi
+// ===== Pin GPIO Servo =====
+const int PIN_SERVO_BASE     = 5;  // D1
+const int PIN_SERVO_SHOULDER = 4;  // D2
+const int PIN_SERVO_ELBOW    = 14; // D5
+const int PIN_SERVO_GRIPPER  = 12; // D6
 
-// ===== Motor Conveyor via DRV8833 =====
-const int PIN_IN1 = 13; // GPIO 13 (D7) -> DRV8833 IN1 (PWM kecepatan)
-const int PIN_IN2 = 15; // GPIO 15 (D8) -> DRV8833 IN2 (selalu LOW = putar satu arah)
-const int CONVEYOR_SPEED = 195;     // 0 - 1023 (range PWM ESP8266)
-const int CONVEYOR_PWM_FREQ = 1000; // Hz
-const int CONVEYOR_PWM_MAX = 1023;  // Range PWM ESP8266 (0 - 1023)
-const bool CONVEYOR_ON = true;      // Set false untuk menonaktifkan conveyor sepenuhnya (tes)
+// ===== Alamat Register Modbus =====
+const uint16_t REG_BASE     = 0; // %QW0
+const uint16_t REG_SHOULDER = 1; // %QW1
+const uint16_t REG_ELBOW    = 2; // %QW2
+const uint16_t REG_GRIPPER  = 3; // %QW3
 
-// Jalankan motor conveyor (speed 0 - 1023)
-void conveyorRun(int speed) {
-  speed = constrain(speed, 0, CONVEYOR_PWM_MAX);
-  digitalWrite(PIN_IN2, LOW);
-  analogWrite(PIN_IN1, speed);
-  Serial.print("[CONVEYOR] RUN, speed = ");
-  Serial.println(speed);
-}
+// Objek Servo & Modbus
+Servo servoBase;
+Servo servoShoulder;
+Servo servoElbow;
+Servo servoGripper;
 
-// Hentikan motor conveyor
-void conveyorStop() {
-  analogWrite(PIN_IN1, 0);
-  digitalWrite(PIN_IN2, LOW);
-  Serial.println("[CONVEYOR] STOP");
-}
+ModbusIP mb;
 
-// Posisi Stand By Awal
-const float FIXED_BASE  = 65.0;
-float currentShoulder   = 150.0;
-float currentElbow      = 120.0;
-float currentGripper    = 40.0;
+// Simpan nilai sudut sebelumnya untuk deteksi perubahan
+int lastBase     = -1;
+int lastShoulder = -1;
+int lastElbow    = -1;
+int lastGripper  = -1;
 
-// Parameter kecepatan default
-const float DEFAULT_STEP = 1.5; // Derajat per step
-const int   DEFAULT_DLY  = 10;  // ms per step
-
-// Parameter khusus gerakan berat (shoulder saat lengan terentang)
-const float HEAVY_STEP = 0.8;
-const int   HEAVY_DLY  = 15;
-
-// Waktu servo menyusul posisi fisik setelah gerakan selesai
-const int SETTLE_MS = 400;
-
-// Waktu terakhir siklus arm selesai
-unsigned long lastCycleEnd = 0;
-
-// Fungsi Interpolasi Mulus 3 Servo, kecepatan bisa diatur per gerakan
-void move3AxisSmooth(float targetShoulder, float targetElbow, float targetGripper,
-                     float stepSpeed = DEFAULT_STEP, int stepDelay = DEFAULT_DLY) {
-  bool inPosition = false;
-
-  while (!inPosition) {
-    inPosition = true;
-
-    // Shoulder
-    if (abs(targetShoulder - currentShoulder) > stepSpeed) {
-      currentShoulder += (targetShoulder > currentShoulder) ? stepSpeed : -stepSpeed;
-      inPosition = false;
-    } else {
-      currentShoulder = targetShoulder;
-    }
-
-    // Elbow
-    if (abs(targetElbow - currentElbow) > stepSpeed) {
-      currentElbow += (targetElbow > currentElbow) ? stepSpeed : -stepSpeed;
-      inPosition = false;
-    } else {
-      currentElbow = targetElbow;
-    }
-
-    // Gripper
-    if (abs(targetGripper - currentGripper) > stepSpeed) {
-      currentGripper += (targetGripper > currentGripper) ? stepSpeed : -stepSpeed;
-      inPosition = false;
-    } else {
-      currentGripper = targetGripper;
-    }
-
-    // Eksekusi ke Servo Fisik
-    servoShoulder.write((int)currentShoulder);
-    servoElbow.write(180 - (int)currentElbow); // Inversi orientasi servo Elbow
-    servoGripper.write((int)currentGripper);
-
-    delay(stepDelay);
-    yield(); // Beri waktu ke watchdog ESP8266
-  }
-
-  // Beri waktu servo fisik menyusul posisi perintah
-  delay(SETTLE_MS);
-}
-
-// Baca sensor IR mentah: true = ada benda
-bool irRaw() {
-  int v = digitalRead(PIN_IR);
-  return IR_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
-}
-
-// Deteksi benda dengan konfirmasi (anti-noise)
-bool objectDetected() {
-  if (!irRaw()) return false;
-  unsigned long start = millis();
-  while (millis() - start < IR_CONFIRM_MS) {
-    if (!irRaw()) return false; // Hanya noise sesaat
-    yield();
-  }
-  return true;
-}
-
-// Urutan kerja arm (mulai dan berakhir di posisi Stand By)
-void runArmSequence() {
-  // 2. Move (Shoulder: 100, Elbow: 55, Gripper: 40)
-  Serial.println("[POSE] 2. Move (100, 55, 40)");
-  move3AxisSmooth(100.0, 55.0, 40.0);
-  delay(1000);
-
-  // 3. Grip (Shoulder: 100, Elbow: 55, Gripper: 120)
-  Serial.println("[POSE] 3. Grip (100, 55, 120)");
-  move3AxisSmooth(100.0, 55.0, 120.0);
-  delay(1000);
-
-  // 4a. Move to Place - TAHAP 1: Siku bergerak dulu (Elbow: 55 -> 175)
-  Serial.println("[POSE] 4a. Siku Dulu (110, 175, 120)");
-  move3AxisSmooth(110.0, 175.0, 120.0);
-  delay(1000); // Jeda agar elbow stabil sebelum shoulder bergerak
-
-  // 4b. Move to Place - TAHAP 2: Shoulder menyusul (diperlambat)
-  Serial.println("[POSE] 4b. Shoulder Menyusul (55, 175, 110)");
-  move3AxisSmooth(55.0, 175.0, 110.0, HEAVY_STEP, HEAVY_DLY);
-  delay(1000);
-
-  // 5. Place (Shoulder: 55, Elbow: 175, Gripper: 40)
-  Serial.println("[POSE] 5. Place (55, 175, 40)");
-  move3AxisSmooth(55.0, 175.0, 40.0);
-  delay(1000);
-
-  // 6. Stand By - kembali ke posisi awal (diperlambat)
-  Serial.println("[POSE] 6. Stand By (150, 120, 40)");
-  move3AxisSmooth(150.0, 120.0, 40.0, HEAVY_STEP, HEAVY_DLY);
-  delay(500);
-}
+unsigned long lastHeartbeat = 0;
 
 void setup() {
   Serial.begin(115200);
+  delay(300);
 
-  // Nonaktifkan Wi-Fi
-  WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println("  ESP8266 Server Modbus TCP untuk OpenPLC ");
+  Serial.println("==========================================");
 
-  // Konfigurasi Sensor IR
-  pinMode(PIN_IR, INPUT);
+  // Attach Servo
+  servoBase.attach(PIN_SERVO_BASE, 500, 2500);
+  servoShoulder.attach(PIN_SERVO_SHOULDER, 500, 2500);
+  servoElbow.attach(PIN_SERVO_ELBOW, 500, 2500);
+  servoGripper.attach(PIN_SERVO_GRIPPER, 500, 2500);
 
-  // Konfigurasi Motor Conveyor (DRV8833)
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  analogWriteFreq(CONVEYOR_PWM_FREQ);
+  // Posisi default awal saat ESP baru nyala
+  servoBase.write(65);
+  servoShoulder.write(150);
+  servoElbow.write(90);
+  servoGripper.write(40);
 
-  // Attach Servo Pins
-  servoBase.attach(PIN_SERVO1, 500, 2500);
-  servoShoulder.attach(PIN_SERVO2, 500, 2500);
-  servoElbow.attach(PIN_SERVO3, 500, 2500);
-  servoGripper.attach(PIN_SERVO4, 500, 2500);
+  // Hubungkan ke WiFi
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP); // Wajib agar Modbus tidak lag/timeout
 
-  // Posisi awal langsung ke Stand By
-  servoBase.write((int)FIXED_BASE);
-  servoShoulder.write((int)currentShoulder);
-  servoElbow.write(180 - (int)currentElbow);
-  servoGripper.write((int)currentGripper);
+  Serial.print("[WIFI] Menghubungkan ke ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  Serial.println("--- Otomasi Robot Arm + Sensor IR + Conveyor ---");
-  delay(3000); // Tahan posisi Stand By awal
+  unsigned long startWifi = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startWifi < 20000) {
+    delay(300);
+    Serial.print(".");
+  }
 
-  // Conveyor mulai berputar, menunggu benda
-  if (CONVEYOR_ON) conveyorRun(CONVEYOR_SPEED);
-  lastCycleEnd = millis() - COOLDOWN_MS; // Sensor langsung aktif
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Terhubung!");
+    Serial.print("  -> IP ESP: ");
+    Serial.println(WiFi.localIP());
+    Serial.println("  -> CATAT IP DI ATAS DAN MASUKKAN KE OPENPLC REMOTE DEVICE!");
+  } else {
+    Serial.println("\n[WIFI] GAGAL TERHUBUNG (Timeout 20 detik)!");
+    Serial.println("  -> Pastikan SSID & Password di secrets.h sudah benar.");
+    Serial.println("  -> Pastikan ESP dan Laptop berada di jaringan WiFi yang SAMA.");
+  }
+
+  // Jalankan Modbus TCP Server (Port 502)
+  mb.server();
+
+  // Daftarkan Holding Register dengan nilai awal
+  mb.addHreg(REG_BASE,     65);
+  mb.addHreg(REG_SHOULDER, 150);
+  mb.addHreg(REG_ELBOW,    90);
+  mb.addHreg(REG_GRIPPER,  40);
+
+  lastBase     = 65;
+  lastShoulder = 150;
+  lastElbow    = 90;
+  lastGripper  = 40;
+
+  Serial.println("[MODBUS] Siap menerima nilai MOVE dari OpenPLC!");
+  Serial.println("==========================================");
 }
 
 void loop() {
-  // Abaikan sensor selama masa cooldown setelah siklus selesai
-  if (millis() - lastCycleEnd < COOLDOWN_MS) {
-    yield();
-    return;
+  // Layani koneksi Modbus dari OpenPLC
+  mb.task();
+
+  // Ambil nilai register terkini yang dikirim OpenPLC
+  int valBase     = constrain((int)mb.Hreg(REG_BASE),     0, 180);
+  int valShoulder = constrain((int)mb.Hreg(REG_SHOULDER), 0, 180);
+  int valElbow    = constrain((int)mb.Hreg(REG_ELBOW),    0, 180);
+  int valGripper  = constrain((int)mb.Hreg(REG_GRIPPER),  0, 180);
+
+  // Jika ada perubahan dari OpenPLC -> langsung gerakkan servo seketika!
+  if (valBase != lastBase) {
+    lastBase = valBase;
+    servoBase.write(valBase);
+    Serial.printf("[MOVE] Base (%QW0) -> %d deg\n", valBase);
   }
 
-  if (objectDetected()) {
-    Serial.println("[IR] Benda terdeteksi");
+  if (valShoulder != lastShoulder) {
+    lastShoulder = valShoulder;
+    servoShoulder.write(valShoulder);
+    Serial.printf("[MOVE] Shoulder (%QW1) -> %d deg\n", valShoulder);
+  }
 
-    // 1. Conveyor berhenti
-    conveyorStop();
-    delay(STOP_SETTLE_MS); // Tunggu benda benar-benar diam
+  if (valElbow != lastElbow) {
+    lastElbow = valElbow;
+    servoElbow.write(valElbow);
+    Serial.printf("[MOVE] Elbow (%QW2) -> %d deg\n", valElbow);
+  }
 
-    // 2. Jalankan fungsi arm
-    runArmSequence();
+  if (valGripper != lastGripper) {
+    lastGripper = valGripper;
+    servoGripper.write(valGripper);
+    Serial.printf("[MOVE] Gripper (%QW3) -> %d deg\n", valGripper);
+  }
 
-    // 3. Arm sudah kembali ke Stand By -> conveyor jalan lagi
-    if (CONVEYOR_ON) conveyorRun(CONVEYOR_SPEED);
-    lastCycleEnd = millis();
-    Serial.println("[IR] Siklus selesai, menunggu benda berikutnya");
+  // Cetak status heartbeat tiap 3 detik
+  if (millis() - lastHeartbeat >= 3000) {
+    lastHeartbeat = millis();
+    Serial.printf("[STATUS] IP: %s | Base: %d | Shoulder: %d | Elbow: %d | Gripper: %d\n",
+                  WiFi.localIP().toString().c_str(),
+                  valBase, valShoulder, valElbow, valGripper);
   }
 
   yield();

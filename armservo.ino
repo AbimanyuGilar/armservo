@@ -59,10 +59,12 @@ const int  IR_DEBOUNCE_MS  = 20;          // Filter anti-noise non-blocking (ms)
 const int  PIN_STATUS_LED  = LED_BUILTIN; // D4 -> LED onboard ESP8266 (Active LOW)
 
 // ===== Konfigurasi Conveyor (Driver DRV8833) =====
-const int PIN_CONV_IN1     = 13;   // D7 -> DRV8833 IN1 (PWM)
-const int PIN_CONV_IN2     = 15;   // D8 -> DRV8833 IN2 (LOW)
-const int CONVEYOR_SPEED   = 1000;  // Kecepatan conveyor ditentukan di sini (0 - 1023)
-const int CONV_PWM_FREQ    = 1000; // Frekuensi PWM (Hz)
+const int PIN_CONV_IN1        = 13;   // D7 -> DRV8833 IN1 (PWM)
+const int PIN_CONV_IN2        = 15;   // D8 -> DRV8833 IN2 (LOW)
+const int CONV_START_SPEED    = 500;  // Kecepatan awal saat conveyor mulai jalan (0 - 1023)
+const int CONV_RUN_SPEED      = 350;  // Kecepatan normal setelah kick-start (0 - 1023)
+const unsigned long CONV_KICK_TIME = 300; // Durasi kecepatan awal sebelum turun (ms)
+const int CONV_PWM_FREQ       = 1000; // Frekuensi PWM (Hz)
 
 // ===== Alamat Register Modbus (Cocok Persis dengan OpenPLC Anda) =====
 const uint16_t REG_BASE        = 0; // %QW0 -> Offset 0
@@ -104,7 +106,9 @@ unsigned long lastStepElbow    = 0;
 unsigned long lastStepGripper  = 0;
 
 // ===== Variabel Status Conveyor =====
-bool conveyorRunning = false;
+bool conveyorRunning          = false;
+int currentConvSpeed          = 0;
+unsigned long convStartTime   = 0;
 
 // ===== Variabel Status IR (Debounce Non-Blocking) =====
 bool irDetected        = false;
@@ -114,19 +118,25 @@ unsigned long lastIrChangeTime = 0;
 // ===== Timer Heartbeat =====
 unsigned long lastHeartbeat = 0;
 
-// Fungsi Menjalankan Conveyor
-void conveyorRun(int speed) {
+// Helper Mengatur Kecepatan PWM Conveyor
+void conveyorSetSpeed(int speed) {
   speed = constrain(speed, 0, 1023);
+  currentConvSpeed = speed;
   digitalWrite(PIN_CONV_IN2, LOW);
   analogWrite(PIN_CONV_IN1, speed);
+}
+
+// Fungsi Menjalankan Conveyor
+void conveyorRun(int speed) {
+  conveyorSetSpeed(speed);
   conveyorRunning = true;
-  Serial.printf("[CONVEYOR] RUN (Speed: %d)\n", speed);
+  convStartTime = millis();
+  Serial.printf("[CONVEYOR] RUN (Start Speed: %d)\n", speed);
 }
 
 // Fungsi Menghentikan Conveyor
 void conveyorStop() {
-  analogWrite(PIN_CONV_IN1, 0);
-  digitalWrite(PIN_CONV_IN2, LOW);
+  conveyorSetSpeed(0);
   conveyorRunning = false;
   Serial.println("[CONVEYOR] STOP");
 }
@@ -299,9 +309,14 @@ void loop() {
   // 3. Kontrol Motor Conveyor dari OpenPLC
   bool cmdConv = mb.Coil(COIL_CONVEYOR) || mb.Coil(0);
 
-  if (cmdConv && !conveyorRunning) {
-    conveyorRun(CONVEYOR_SPEED);
-  } else if (!cmdConv && conveyorRunning) {
+  if (cmdConv) {
+    if (!conveyorRunning) {
+      conveyorRun(CONV_START_SPEED);
+    } else if (currentConvSpeed != CONV_RUN_SPEED && (millis() - convStartTime >= CONV_KICK_TIME)) {
+      conveyorSetSpeed(CONV_RUN_SPEED);
+      Serial.printf("[CONVEYOR] Speed disesuaikan ke %d (setelah %lu ms)\n", CONV_RUN_SPEED, CONV_KICK_TIME);
+    }
+  } else if (conveyorRunning) {
     conveyorStop();
   }
 
@@ -342,7 +357,7 @@ void loop() {
                   WiFi.localIP().toString().c_str(),
                   irDetected ? 1 : 0,
                   conveyorRunning ? "RUN" : "STOP",
-                  CONVEYOR_SPEED,
+                  currentConvSpeed,
                   curBase, curShoulder, curElbow, curGripper);
   }
 

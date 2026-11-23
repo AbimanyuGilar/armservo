@@ -44,6 +44,14 @@ const int PIN_SERVO_GRIPPER  = 12; // D6
 // Set true jika orientasi servo Elbow dipasang terbalik secara fisik
 const bool INVERT_ELBOW = false;
 
+// ===== Konfigurasi Smooth Movement Servo (Non-Blocking) =====
+// Semakin KECIL nilai ms = semakin CEPAT gerakan servo (misal: 8 - 12 ms untuk arm, 4 - 8 ms untuk gripper)
+// Semakin BESAR nilai ms = semakin LAMBAT & HALUS
+const unsigned long STEP_DELAY_BASE     = 12; // ms per 1 derajat
+const unsigned long STEP_DELAY_SHOULDER = 15; // ms per 1 derajat (sedikit lebih pelan karena menahan beban)
+const unsigned long STEP_DELAY_ELBOW    = 14; // ms per 1 derajat
+const unsigned long STEP_DELAY_GRIPPER  = 8;  // ms per 1 derajat
+
 // ===== Konfigurasi Pin Sensor IR =====
 const int  PIN_IR          = 16;          // D0 -> OUT sensor IR FC-51
 const bool IR_ACTIVE_LOW   = true;        // Sensor FC-51: LOW saat ada benda
@@ -57,14 +65,12 @@ const int CONVEYOR_SPEED   = 1000;  // Kecepatan conveyor ditentukan di sini (0 
 const int CONV_PWM_FREQ    = 1000; // Frekuensi PWM (Hz)
 
 // ===== Alamat Register Modbus (Cocok Persis dengan OpenPLC Anda) =====
-// Holding Registers (FC 06 / %QW dari OpenPLC)
 const uint16_t REG_BASE        = 0; // %QW0 -> Offset 0
 const uint16_t REG_SHOULDER    = 1; // %QW1 -> Offset 1
 const uint16_t REG_ELBOW       = 2; // %QW2 -> Offset 2
 const uint16_t REG_GRIPPER     = 3; // %QW3 -> Offset 3
 const uint16_t REG_IR_STATUS   = 4; // %QW4 / %IW4 mirror -> Offset 4
 
-// Coils (%QX dan %IX) Sesuai Gambar IO Tag Mapping OpenPLC
 const uint16_t COIL_CONVEYOR   = 4; // %QX0.0 -> Offset 4 (FC 05 Write Coil)
 const uint16_t COIL_IR         = 5; // %IX0.0 -> Offset 5 (FC 01 Read Coils)
 
@@ -76,11 +82,26 @@ Servo servoGripper;
 
 ModbusIP mb;
 
-// ===== Variabel Status Servo =====
-int lastBase     = -1;
-int lastShoulder = -1;
-int lastElbow    = -1;
-int lastGripper  = -1;
+// ===== Variabel Posisi & Smooth Servo =====
+int curBase     = 65;
+int curShoulder = 150;
+int curElbow    = 90;
+int curGripper  = 40;
+
+int targetBase     = 65;
+int targetShoulder = 150;
+int targetElbow    = 90;
+int targetGripper  = 40;
+
+int lastLoggedBase     = -1;
+int lastLoggedShoulder = -1;
+int lastLoggedElbow    = -1;
+int lastLoggedGripper  = -1;
+
+unsigned long lastStepBase     = 0;
+unsigned long lastStepShoulder = 0;
+unsigned long lastStepElbow    = 0;
+unsigned long lastStepGripper  = 0;
 
 // ===== Variabel Status Conveyor =====
 bool conveyorRunning = false;
@@ -118,19 +139,35 @@ bool readIrRaw() {
 
 // Update status IR ke register Modbus
 void updateIrModbus(bool state) {
-  // Sesuai OpenPLC: Offset 6 (FC 01 Read Coils)
   mb.Coil(COIL_IR, state);
-  // Cadangan jika OpenPLC masih membaca offset 2 atau 0
   mb.Coil(2, state);
   mb.Ists(0, state);
   mb.Ists(2, state);
   mb.Ists(6, state);
 
-  // Mirror ke Holding Register (FC 03, offset 4)
   mb.Hreg(REG_IR_STATUS, state ? 1 : 0);
 
-  // LED Onboard ESP8266 (Active LOW)
   digitalWrite(PIN_STATUS_LED, state ? LOW : HIGH);
+}
+
+// Helper: Menggerakkan satu servo selangkah demi selangkah secara non-blocking
+void stepServoSmooth(Servo &srv, int &currentPos, int targetPos,
+                     unsigned long &lastStepTime, unsigned long stepDelayMs,
+                     bool invertOutput = false) {
+  if (currentPos == targetPos) return;
+
+  unsigned long now = millis();
+  if ((now - lastStepTime) >= stepDelayMs) {
+    lastStepTime = now;
+    if (currentPos < targetPos) {
+      currentPos++;
+    } else {
+      currentPos--;
+    }
+
+    int outAngle = invertOutput ? (180 - currentPos) : currentPos;
+    srv.write(constrain(outAngle, 0, 180));
+  }
 }
 
 void setup() {
@@ -145,7 +182,7 @@ void setup() {
   // Inisialisasi Pin IR & LED Indikator
   pinMode(PIN_IR, INPUT);
   pinMode(PIN_STATUS_LED, OUTPUT);
-  digitalWrite(PIN_STATUS_LED, HIGH); // LED Built-in mati di awal (Active LOW)
+  digitalWrite(PIN_STATUS_LED, HIGH);
 
   // Inisialisasi Pin Conveyor
   pinMode(PIN_CONV_IN1, OUTPUT);
@@ -162,16 +199,26 @@ void setup() {
   servoGripper.attach(PIN_SERVO_GRIPPER, 500, 2500);
 
   // Posisi default awal saat ESP baru nyala
-  servoBase.write(65);
-  servoShoulder.write(150);
-  servoElbow.write(INVERT_ELBOW ? (180 - 90) : 90);
-  servoGripper.write(40);
+  curBase     = 65;
+  curShoulder = 150;
+  curElbow    = 90;
+  curGripper  = 40;
+
+  targetBase     = curBase;
+  targetShoulder = curShoulder;
+  targetElbow    = curElbow;
+  targetGripper  = curGripper;
+
+  servoBase.write(curBase);
+  servoShoulder.write(curShoulder);
+  servoElbow.write(INVERT_ELBOW ? (180 - curElbow) : curElbow);
+  servoGripper.write(curGripper);
 
   // Hubungkan ke WiFi
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP); // Wajib agar Modbus tidak lag/timeout
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
 
   Serial.print("[WIFI] Menghubungkan ke ");
   Serial.println(WIFI_SSID);
@@ -198,19 +245,14 @@ void setup() {
   mb.server();
 
   // Daftarkan Holding Register (Offset 0..5)
-  mb.addHreg(REG_BASE,      65);  // Offset 0 (%QW0)
-  mb.addHreg(REG_SHOULDER,  150); // Offset 1 (%QW1)
-  mb.addHreg(REG_ELBOW,     90);  // Offset 2 (%QW2)
-  mb.addHreg(REG_GRIPPER,   40);  // Offset 3 (%QW3)
-  mb.addHreg(REG_IR_STATUS, 0);   // Offset 4 (%QW4 / %IW4)
-  mb.addHreg(5,             0);   // Offset 5
+  mb.addHreg(REG_BASE,      targetBase);     // Offset 0 (%QW0)
+  mb.addHreg(REG_SHOULDER,  targetShoulder); // Offset 1 (%QW1)
+  mb.addHreg(REG_ELBOW,     targetElbow);    // Offset 2 (%QW2)
+  mb.addHreg(REG_GRIPPER,   targetGripper);  // Offset 3 (%QW3)
+  mb.addHreg(REG_IR_STATUS, 0);              // Offset 4 (%QW4 / %IW4)
+  mb.addHreg(5,             0);              // Offset 5
 
-  lastBase     = 65;
-  lastShoulder = 150;
-  lastElbow    = 90;
-  lastGripper  = 40;
-
-  // Daftarkan Coils 0 s/d 7 secara berurutan agar request read tidak pernah error
+  // Daftarkan Coils 0 s/d 7 secara berurutan
   for (int c = 0; c < 8; c++) {
     mb.addCoil(c, false);
   }
@@ -236,7 +278,7 @@ void setup() {
 }
 
 void loop() {
-  // 1. Layani komunikasi Modbus TCP dari OpenPLC (Wajib dipanggil sering)
+  // 1. Layani komunikasi Modbus TCP dari OpenPLC
   mb.task();
 
   // 2. Pembacaan Sensor IR dengan Debounce Non-Blocking
@@ -254,7 +296,7 @@ void loop() {
     }
   }
 
-  // 3. Kontrol Motor Conveyor dari OpenPLC via Coil (%QX0.0 di Offset 4, atau Offset 0)
+  // 3. Kontrol Motor Conveyor dari OpenPLC
   bool cmdConv = mb.Coil(COIL_CONVEYOR) || mb.Coil(0);
 
   if (cmdConv && !conveyorRunning) {
@@ -263,48 +305,45 @@ void loop() {
     conveyorStop();
   }
 
-  // 4. Kontrol Servo Arm dari Register OpenPLC (%QW0..%QW3)
-  int valBase     = constrain((int)mb.Hreg(REG_BASE),     0, 180);
-  int valShoulder = constrain((int)mb.Hreg(REG_SHOULDER), 0, 180);
-  int valElbow    = constrain((int)mb.Hreg(REG_ELBOW),    0, 180);
-  int valGripper  = constrain((int)mb.Hreg(REG_GRIPPER),  0, 180);
+  // 4. Baca target sudut dari Register OpenPLC (%QW0..%QW3)
+  targetBase     = constrain((int)mb.Hreg(REG_BASE),     0, 180);
+  targetShoulder = constrain((int)mb.Hreg(REG_SHOULDER), 0, 180);
+  targetElbow    = constrain((int)mb.Hreg(REG_ELBOW),    0, 180);
+  targetGripper  = constrain((int)mb.Hreg(REG_GRIPPER),  0, 180);
 
-  // Jika ada perubahan dari OpenPLC -> langsung gerakkan servo seketika!
-  if (valBase != lastBase) {
-    lastBase = valBase;
-    servoBase.write(valBase);
-    Serial.printf("[MOVE] Base (%QW0) -> %d deg\n", valBase);
+  // Log ke Serial hanya saat target baru berubah dari OpenPLC
+  if (targetBase != lastLoggedBase) {
+    lastLoggedBase = targetBase;
+    Serial.printf("[TARGET] Base (%QW0) -> %d deg (Smooth)\n", targetBase);
+  }
+  if (targetShoulder != lastLoggedShoulder) {
+    lastLoggedShoulder = targetShoulder;
+    Serial.printf("[TARGET] Shoulder (%QW1) -> %d deg (Smooth)\n", targetShoulder);
+  }
+  if (targetElbow != lastLoggedElbow) {
+    lastLoggedElbow = targetElbow;
+    Serial.printf("[TARGET] Elbow (%QW2) -> %d deg (Smooth)\n", targetElbow);
+  }
+  if (targetGripper != lastLoggedGripper) {
+    lastLoggedGripper = targetGripper;
+    Serial.printf("[TARGET] Gripper (%QW3) -> %d deg (Smooth)\n", targetGripper);
   }
 
-  if (valShoulder != lastShoulder) {
-    lastShoulder = valShoulder;
-    servoShoulder.write(valShoulder);
-    Serial.printf("[MOVE] Shoulder (%QW1) -> %d deg\n", valShoulder);
-  }
-
-  if (valElbow != lastElbow) {
-    lastElbow = valElbow;
-    int targetElbow = INVERT_ELBOW ? (180 - valElbow) : valElbow;
-    servoElbow.write(targetElbow);
-    Serial.printf("[MOVE] Elbow (%QW2) -> %d deg (Fisik: %d deg)\n", valElbow, targetElbow);
-  }
-
-  if (valGripper != lastGripper) {
-    lastGripper = valGripper;
-    servoGripper.write(valGripper);
-    Serial.printf("[MOVE] Gripper (%QW3) -> %d deg\n", valGripper);
-  }
+  // Eksekusi langkah gerakan smooth tiap servo secara independen
+  stepServoSmooth(servoBase,     curBase,     targetBase,     lastStepBase,     STEP_DELAY_BASE,     false);
+  stepServoSmooth(servoShoulder, curShoulder, targetShoulder, lastStepShoulder, STEP_DELAY_SHOULDER, false);
+  stepServoSmooth(servoElbow,    curElbow,    targetElbow,    lastStepElbow,    STEP_DELAY_ELBOW,    INVERT_ELBOW);
+  stepServoSmooth(servoGripper,  curGripper,  targetGripper,  lastStepGripper,  STEP_DELAY_GRIPPER,  false);
 
   // 5. Cetak status Heartbeat tiap 3 detik
   if (millis() - lastHeartbeat >= 3000) {
     lastHeartbeat = millis();
-    Serial.printf("[STATUS] IP: %s | IR: %d | Conv: %s (%d) | Coil4(Conv): %d | Coil6(IR): %d\n",
+    Serial.printf("[STATUS] IP: %s | IR: %d | Conv: %s (%d) | Pos(B/S/E/G): %d/%d/%d/%d\n",
                   WiFi.localIP().toString().c_str(),
                   irDetected ? 1 : 0,
                   conveyorRunning ? "RUN" : "STOP",
                   CONVEYOR_SPEED,
-                  mb.Coil(COIL_CONVEYOR) ? 1 : 0,
-                  mb.Coil(COIL_IR) ? 1 : 0);
+                  curBase, curShoulder, curElbow, curGripper);
   }
 
   yield();
